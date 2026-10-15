@@ -1,0 +1,20 @@
+{
+  "id": "qwenpaw-chat-batch",
+  "name": "会话批量管理",
+  "version": "0.0.1",
+  "description": "侧栏「历史对话」标题右边一个小按钮（26×26，与宿主自带图标同款）展开小面板，按条件筛出会话后批量删除 / 批量归档 / 批量还原；挂在操作行内、不新占一行也不挤压聊天区（宿主槽位表里没有这一行，故用原生 DOM 挂载 + MutationObserver 重建）。与宿主自带的「控制 → 会话」页分工：宿主那页已有分页表格多选 + 批量删除/归档/还原，本插件不重复它，只补宿主没有的那半边——①规则化选择：保留最近 N 个（其余全选）、按来源（chat/cron/subagent）、按「早于 X 天」、按名称或 session_id 关键字，一键全选筛选结果 / 反选 / 只看已选；②跨全部结果选择（宿主分页每页 10 条，只能一页一页勾）；③危险保护：运行中的会话一律不可勾选——宿主的 batch-delete 没有 running 保护，会直接删掉正在跑的任务的会话记录——删除要在确认框里再勾一次「我已确认」，单独列出「当前打开的会话」，运行中会话要删必须显式打开开关；④结果如实回报：归档/还原用服务端的 succeeded/failed（含 in_progress / not_found 原因），删除因接口只回布尔，改用操作前后列表 diff 报真实删掉的数量。纯前端插件（type=frontend），不写宿主文件、不起后端进程，筛选条件存浏览器本地，卸载即无残留（有意不做：重命名/置顶/分组、会话内容导出、评论备注——宿主 ChatUpdate 是 extra=\"forbid\"，只允许 name/pinned/group_id，服务端存不下备注）。",
+  "author": "archigram",
+  "license": "Apache-2.0",
+  "type": "frontend",
+  "qwenpaw_version": {
+    "min": "2.2.1",
+    "max": "2.99.0"
+  },
+  "entry": {
+    "frontend": "index.js"
+  },
+  "meta": {
+    "category": "ui",
+    "icon": "🗂"
+  }
+}
