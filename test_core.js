@@ -79,7 +79,7 @@ test("filterChats：来源 + 关键字（名称或 session_id，忽略大小写�
   assert.deepEqual(q({ view: "all", q: "   " }), ["1", "2", "3"]);
 });
 
-test("filterChats：时间窗口只留「早于 N 天」，隐藏运行中", () => {
+test("filterChats：时间窗口只留「N 天前」，隐藏运行中", () => {
   const list = [
     chat("fresh", { updated_at: days(0.5) }),
     chat("old5", { updated_at: days(5) }),
@@ -94,7 +94,7 @@ test("filterChats：时间窗口只留「早于 N 天」，隐藏运行中", () 
     CORE.filterChats(list, { view: "all", hideRunning: true }, NOW).map((c) => c.id),
     ["fresh", "old5", "old40"],
   );
-  // 时间戳坏了就不算「早于」，避免误选中
+  // 时间戳坏了就不算「N 天前」，避免误选中
   assert.deepEqual(CORE.filterChats([chat("bad", { updated_at: "not-a-date" })], { view: "all", ageDays: 1 }, NOW), []);
 });
 

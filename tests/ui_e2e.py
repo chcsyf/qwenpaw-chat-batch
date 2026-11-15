@@ -6,7 +6,7 @@
 刷新即无痕），然后像用户一样点按钮走完整流程：
 
     打开面板 → 关键字筛选 → 「保留最近 1 个」规则选中其余 → 归档 → 切到已归档
-    → 全选筛选结果 → 还原 → 全选 → 删除（确认框里勾「我已确认」）
+    → 全选 → 还原 → 全选 → 删除（确认框里勾「我已确认」）
 
 每一步的最终结果都用**独立通道**（Python 直接打 HTTP API）核对，不信 UI 的自述。
 
@@ -74,6 +74,19 @@ def cleanup(base: str, agent: str) -> None:
     print(("  ✅ " if left == 0 else "  ❌ ") + f"收尾清理：临时会话剩余 {left} 个")
     if left:
         FAILED.append("cleanup")
+
+
+def wait_for(fn, timeout: float = 20.0, interval: float = 0.3):
+    """轮询等一个条件成立（面板不再有 .qcb-msg，只能以服务端事实为准）。"""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            if fn():
+                return True
+        except Exception:
+            pass
+        time.sleep(interval)
+    return False
 
 
 def chromium_path(pw):
@@ -217,7 +230,7 @@ def main() -> int:
             check("面板能读到当前会话路由", page.evaluate("window.__qwenpawChatBatch.state.currentChatId !== undefined"))
 
             # ---------- 3. 关键字筛选 ----------
-            page.fill(".qcb-filters input[type=text]", "qcb-e2e-" + stamp)
+            page.fill("input.qcb-search", "qcb-e2e-" + stamp)
             page.wait_for_function("document.querySelectorAll('.qcb-row').length === 3", timeout=10000)
             rows = page.eval_on_selector_all(".qcb-row .qcb-name", "els => els.map(e => e.textContent.trim())")
             check("关键字筛选命中我的 3 个临时会话", len(rows) == 3 and all(MARK in r for r in rows), f"{[r[:28] for r in rows]}")
@@ -230,33 +243,30 @@ def main() -> int:
             sel = page.eval_on_selector_all(".qcb-row[data-sel=true]", "els => els.length")
             foot = page.inner_text(".qcb-foot .qcb-count")
             check("「保留最近 1 个」选中其余 2 个", sel == 2, f"选中的行={sel}；脚注={foot}")
-            check("脚注只把可归档的算进归档数", "可归档 2" in foot, foot)
+            # 脚注改成「已加载 N 个会话」，选中数量只体现在按钮文案上
+            check("脚注显示已加载会话数", "已加载" in foot and "个会话" in foot, foot)
+            btn_txt = page.inner_text(".qcb-foot button[data-act=archive]")
+            check("归档按钮带可执行数量", "2" in btn_txt, btn_txt)
             shot(page, "2-selected")
 
             # ---------- 5. 归档（真实点击 → 服务端核对） ----------
             page.click(".qcb-foot button[data-act=archive]")
-            page.wait_for_function("document.querySelector('.qcb-msg').textContent.includes('归档完成')", timeout=30000)
-            msg = page.inner_text(".qcb-msg")
-            archived = [c for c in mine(base, agent) if c.get("archived")]
-            check("归档完成提示如实", "成功 2" in msg and "失败 0" in msg, msg)
-            check("服务端事实：恰好 2 个临时会话已归档", len(archived) == 2, f"archived={len(archived)}")
+            ok = wait_for(lambda: len([c for c in mine(base, agent) if c.get("archived")]) == 2)
+            check("归档：服务端恰好 2 个临时会话已归档", ok)
 
             # ---------- 6. 切到已归档 → 全选 → 还原 ----------
             page.click(".qcb-seg button:has-text('已归档')")
             page.wait_for_function("document.querySelectorAll('.qcb-row').length === 2", timeout=10000)
-            page.click(".qcb-quick button:has-text('全选筛选结果')")
+            page.click(".qcb-quick button:has-text('全选')")
             page.wait_for_timeout(200)
             page.click(".qcb-foot button[data-act=unarchive]")
-            page.wait_for_function("document.querySelector('.qcb-msg').textContent.includes('还原完成')", timeout=30000)
-            msg = page.inner_text(".qcb-msg")
-            archived = [c for c in mine(base, agent) if c.get("archived")]
-            check("还原完成提示如实", "成功 2" in msg, msg)
-            check("服务端事实：临时会话已全部还原", len(archived) == 0, f"archived={len(archived)}")
+            ok = wait_for(lambda: len([c for c in mine(base, agent) if c.get("archived")]) == 0)
+            check("还原：服务端临时会话已全部还原", ok)
 
             # ---------- 7. 删除：确认框 + 必勾确认 ----------
             page.click(".qcb-seg button:has-text('活跃')")
             page.wait_for_function("document.querySelectorAll('.qcb-row').length === 3", timeout=10000)
-            page.click(".qcb-quick button:has-text('全选筛选结果')")
+            page.click(".qcb-quick button:has-text('全选')")
             page.wait_for_timeout(200)
             page.click(".qcb-foot button[data-act=delete]")
             page.wait_for_selector(".qcb-confirm", timeout=10000)
@@ -268,10 +278,8 @@ def main() -> int:
             page.wait_for_timeout(200)
             check("勾选确认后按钮可用", not page.query_selector(".qcb-confirm .qcb-acts button[data-primary=true]").is_disabled())
             page.click(".qcb-confirm .qcb-acts button[data-primary=true]")
-            page.wait_for_function("document.querySelector('.qcb-msg').textContent.includes('删除完成')", timeout=30000)
-            msg = page.inner_text(".qcb-msg")
-            check("删除完成提示如实（diff 报数）", "已删除 3 / 3" in msg, msg)
-            check("服务端事实：3 个临时会话都没了", len(mine(base, agent)) == 0)
+            ok = wait_for(lambda: len(mine(base, agent)) == 0)
+            check("删除：服务端 3 个临时会话都没了", ok)
             shot(page, "4-after-delete")
 
             browser.close()

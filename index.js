@@ -1,5 +1,5 @@
 /**
- * qwenpaw-chat-batch v0.0.1 — 会话批量管理（批量删除 / 批量归档 / 批量还原）
+ * qwenpaw-chat-batch v0.1.0 — 会话批量管理（批量删除 / 归档 / 还原 + 已删除会话恢复）
  *
  * 纯前端插件（type=frontend），不写宿主任何文件、不启动后端进程：
  * 在顶栏右侧（slot `header.right`）放一个 🗂 小按钮，点开是一个小面板，
@@ -15,7 +15,11 @@
  *      保护，会直接删掉正在跑的任务的会话记录）；删除要在确认框里再勾一次
  *      「我已确认」，并单独列出「当前打开的会话」；运行中会话要删必须显式开开关；
  *   ④ 结果如实回报：归档/还原用服务端的 succeeded/failed（含 in_progress /
- *      not_found 原因），删除因接口只返回布尔，改用「操作前后列表 diff」报数。
+ *      not_found 原因），删除因接口只返回布尔，改用「操作前后列表 diff」报数；
+ *   ⑤ 「已删除」视图：宿主删会话只摘 chats.json 里的注册条目，sessions/ 下的
+ *      状态文件还在。后端（plugin.py）把「文件在、注册没了」的会话扫出来，
+ *      一条命令补回注册条目即可恢复对话；注册在、文件真没了的则标「已丢失」
+ *      （不可恢复，只能看个名字）。
  *
  * 用到的宿主接口（都在 app/chats/api.py，均需 X-Agent-Id 作用域头）：
  *   GET  /api/chats?include_app_owned=…       列出会话（含实时 status、archived）
@@ -24,9 +28,15 @@
  *   POST /api/chats/batch-delete              裸数组 [chat_id,…]，**不可撤销**
  *                                             （连带删掉该会话的 checkpoint）
  *
+ * 本插件自带的后端（plugin.py，挂 /api/qwenpaw-chat-batch）：
+ *   GET  /orphans?refresh=0                  扫描已删除/已丢失会话（只读）
+ *   POST /restore                            {items:[{session_id,user_id,channel,name}]}
+ *                                            走 chat_manager.get_or_create_chat 补注册
+ *
  * 有意不做：会话内容导出、重命名/置顶/分组（宿主已有）、评论/备注（宿主
  * ChatUpdate 是 extra="forbid"，只允许 name/pinned/group_id，服务端存不下备注，
- * 纯前端插件只能存浏览器本地，容易和用户的预期不符，故不做）。
+ * 纯前端插件只能存浏览器本地，容易和用户的预期不符，故不做）、checkpoint 恢复
+ * （删除时已被 delete_session_checkpoints 清掉，救不回来）。
  *
  * 自检入口：window.__qwenpawChatBatch（open/close/refresh/state/core/api）
  */
@@ -35,7 +45,7 @@
   "use strict";
 
   var PLUGIN_ID = "qwenpaw-chat-batch";
-  var VERSION = "0.0.1";
+  var VERSION = "0.1.0";
 
   /** 与 app/chats/manager.py 的 MAX_BATCH_SIZE 对齐：单次请求的 id 上限 */
   var MAX_BATCH = 500;
@@ -51,9 +61,13 @@
 
   var API = {
     list: "/api/chats",
+    groups: "/api/chats/groups",
     archive: "/api/chats/actions/batch-archive",
     unarchive: "/api/chats/actions/batch-unarchive",
     del: "/api/chats/batch-delete",
+    // 本插件自带后端（plugin.py）
+    orphans: "/api/qwenpaw-chat-batch/orphans",
+    restore: "/api/qwenpaw-chat-batch/restore",
   };
 
   /* ================================================================== *
@@ -105,8 +119,10 @@
         if (flt.view === "active" && c.archived) return false;
         if (flt.view === "archived" && !c.archived) return false;
         if (flt.source && flt.source !== "all" && c.source !== flt.source) return false;
+        if (flt.group && flt.group !== "all" && c.group_id !== flt.group) return false;
         if (flt.hideRunning && CORE.isRunning(c)) return false;
         if (cutoff) {
+          // 会话视图是「N 天前」：只看这段窗口之外没动过的（配合批量删除/归档）
           var t = Date.parse(CORE.lastActive(c));
           if (!isFinite(t) || t >= cutoff) return false;
         }
@@ -265,10 +281,11 @@
    * ================================================================== */
 
   var DEFAULT_FILTERS = {
-    view: "active", // active | archived | all
+    view: "active", // active | archived | all | deleted
     source: "all", // all | chat | cron | subagent
     ageDays: 0, // 0=不限，>0 表示「早于 N 天」
     q: "",
+    group: "all", // 全部分组 / <group_id>（已删除视图里是 recoverable / lost）
     hideRunning: false,
     includeAppOwned: false, // 含 PawApp 会话
     keepN: 10, // 规则「保留最近 N 个」
@@ -304,6 +321,12 @@
     message: null, // {kind:"ok"|"warn"|"err", text:""}
     currentChatId: "",
     anchorRect: null, // 入口按钮的位置，面板贴着它展开
+    groups: [], // 宿主会话分组（GET /api/chats/groups），用于把 group_id 显示成可读名字
+    deleted: null, // 「已删除」扫描结果：null=还没扫，[]=扫过但没有
+    deletedCounts: {},
+    deletedAt: "",
+    deletedLoading: false,
+    deletedSel: {}, // 已删除视图的选择（与聊天 uuid 選択分开存）
   };
   if (!state.filters.q) state.filters.q = "";
 
@@ -317,6 +340,23 @@
 
   function clearSelection() {
     state.selected = {};
+  }
+
+  /** 「已删除」视图里一条记录的唯一键（同 session_id 可能出现在不同 channel/owner） */
+  function deletedKey(it) {
+    return (it.channel || "") + "|" + (it.user_id || "") + "|" + it.session_id;
+  }
+
+  function clearDeletedSel() {
+    state.deletedSel = {};
+  }
+
+  function selectedDeleted() {
+    var out = [];
+    (state.deleted || []).forEach(function (it) {
+      if (it.restorable && state.deletedSel[deletedKey(it)]) out.push(it);
+    });
+    return out;
   }
 
   /* ================================================================== *
@@ -359,6 +399,18 @@
         return json;
       });
     });
+  }
+
+  function loadGroups() {
+    return apiFetch("GET", API.groups)
+      .then(function (list) {
+        state.groups = Array.isArray(list) ? list : [];
+        return state.groups;
+      })
+      .catch(function () {
+        // 分组接口失败不影响其他功能，退回用 chats 里的 group_id
+        return state.groups || [];
+      });
   }
 
   function listChats() {
@@ -420,6 +472,123 @@
     });
   }
 
+  /* ---------- 已删除会话（后端扫描） ---------- */
+
+  function loadDeleted(force) {
+    return apiFetch("GET", API.orphans + (force ? "?refresh=1" : "")).then(function (r) {
+      state.deleted = (r && r.items) || [];
+      state.deletedCounts = (r && r.counts) || {};
+      state.deletedAt = (r && r.scanned_at) || "";
+      // 选过的条目如果消失了 / 变成不可恢复，就从选择里摘掉
+      var alive = {};
+      state.deleted.forEach(function (it) {
+        if (it.restorable) alive[deletedKey(it)] = true;
+      });
+      Object.keys(state.deletedSel).forEach(function (k) {
+        if (!alive[k]) delete state.deletedSel[k];
+      });
+      return state.deleted;
+    });
+  }
+
+  /** 切到「已删除」时才真正扫描，避免每次开面板都读一遍 sessions/ */
+  function ensureDeleted() {
+    if (state.deleted !== null || state.deletedLoading) return;
+    state.deletedLoading = true;
+    setMessage("warn", t("正在扫描已删除会话…", "Scanning deleted chats…"));
+    loadDeleted(true)
+      .then(function (items) {
+        state.deletedLoading = false;
+        setMessage(null);
+        renderList();
+        renderFoot();
+      })
+      .catch(function (err) {
+        state.deletedLoading = false;
+        state.deleted = [];
+        setMessage("err", t("扫描失败：", "Scan failed: ") + ((err && err.message) || err));
+        renderList();
+        renderFoot();
+      });
+  }
+
+  function deletedFiltered() {
+    var items = state.deleted || [];
+    var q = (state.filters.q || "").trim().toLowerCase();
+    var cutoff = state.filters.ageDays > 0 ? Date.now() - state.filters.ageDays * 86400000 : 0;
+    var src = state.filters.source;
+    return items.filter(function (it) {
+      if (src && src !== "all" && (it.source || "chat") !== src) return false;
+      if (state.filters.group === "recoverable" && it.state !== "recoverable") return false;
+      if (state.filters.group === "lost" && it.state === "recoverable") return false;
+      if (cutoff) {
+        // 「N 天以内」：只保留这段时间内还有变动的状态文件
+        var tt = Date.parse(it.mtime);
+        if (!isFinite(tt) || tt < cutoff) return false;
+      }
+      if (q) {
+        var hay = ((it.name || "") + " " + (it.session_id || "")).toLowerCase();
+        if (hay.indexOf(q) < 0) return false;
+      }
+      return true;
+    });
+  }
+
+  function reasonText(code) {
+    if (code === "session_file_missing") return t("状态文件已不存在", "state file missing");
+    if (code === "empty_session") return t("文件里没有对话内容", "no messages in file");
+    if (code === "already_registered") return t("已经注册过了", "already registered");
+    if (code === "unreadable") return t("文件读不出来", "unreadable file");
+    return code || t("未知原因", "unknown");
+  }
+
+  /** 恢复：逐条把注册条目补回 chats.json（后端走 chat_manager，不手写 JSON） */
+  function restoreSelected() {
+    var items = selectedDeleted();
+    if (!items.length || state.busy) return;
+    // 批量恢复挡一下：一次点「全选」就是几百条，别让误点把列表刷满
+    if (items.length > 10) {
+      var ask = t("将恢复 " + items.length + " 个会话，继续？", "Restore " + items.length + " chats?");
+      if (typeof window.confirm === "function" && !window.confirm(ask)) return;
+    }
+    state.busy = true;
+    renderFoot();
+    setMessage("warn", t("正在恢复 " + items.length + " 个…", "Restoring " + items.length + "…"));
+    var payload = {
+      items: items.map(function (it) {
+        return { session_id: it.session_id, user_id: it.user_id || "", channel: it.channel || "", name: it.name || "" };
+      }),
+    };
+    return apiFetch("POST", API.restore, payload)
+      .then(function (r) {
+        state.busy = false;
+        var ok = (r && r.restored) || [];
+        var bad = (r && r.failed) || [];
+        clearDeletedSel();
+        var extra = "";
+        if (bad.length) {
+          var reasons = {};
+          bad.forEach(function (f) {
+            var k = reasonText(f.reason);
+            reasons[k] = (reasons[k] || 0) + 1;
+          });
+          extra = t("（", " (") + Object.keys(reasons).map(function (k) {
+            return k + " " + reasons[k];
+          }).join("，") + "）";
+        }
+        setMessage(
+          bad.length ? "warn" : "ok",
+          t("恢复完成：成功 " + ok.length + "，失败 " + bad.length + extra, "Restored " + ok.length + ", failed " + bad.length + extra),
+        );
+        return refresh({ silent: true });
+      })
+      .catch(function (err) {
+        state.busy = false;
+        setMessage("err", t("恢复失败：", "Restore failed: ") + ((err && err.message) || err));
+        render();
+      });
+  }
+
   /* ================================================================== *
    * 五、视图数据（筛选 → 排序 → 切页）
    * ================================================================== */
@@ -460,6 +629,7 @@
     ".qcb-head{display:flex;align-items:center;gap:8px;padding:8px 10px;border-bottom:1px solid rgba(127,127,127,.2)}",
     ".qcb-title{font-weight:600;flex:1}",
     ".qcb-filters{display:flex;flex-wrap:wrap;gap:6px;padding:8px 10px;border-bottom:1px solid rgba(127,127,127,.16)}",
+    ".qcb-filters select{max-width:132px}",
     ".qcb-filters select,.qcb-filters input[type=text],.qcb-filters input[type=number]{height:26px;border:1px solid rgba(127,127,127,.35);border-radius:6px;background:transparent;color:inherit;padding:0 6px;font-size:12px;min-width:0}",
     ".qcb-filters input[type=text]{flex:1}",
     ".qcb-seg{display:inline-flex;border:1px solid rgba(127,127,127,.35);border-radius:6px;overflow:hidden}",
@@ -469,6 +639,7 @@
     ".qcb-quick{display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:6px 10px;border-bottom:1px solid rgba(127,127,127,.16);font-size:12px}",
     ".qcb-quick button{border:1px solid rgba(127,127,127,.35);background:transparent;color:inherit;border-radius:6px;height:24px;padding:0 8px;cursor:pointer;font-size:12px}",
     ".qcb-quick button:hover{background:rgba(127,127,127,.12)}",
+    ".qcb-search{flex:1 1 160px;min-width:120px}",
     ".qcb-rows{overflow:auto;flex:1;min-height:120px}",
     ".qcb-row{display:flex;align-items:center;gap:8px;padding:5px 10px;border-bottom:1px solid rgba(127,127,127,.1);cursor:default}",
     ".qcb-row:hover{background:rgba(127,127,127,.08)}",
@@ -481,15 +652,16 @@
     ".qcb-tag[data-k=running]{border-color:#d4380d;color:#d4380d}",
     ".qcb-tag[data-k=archived]{border-color:#8c8c8c;color:#8c8c8c}",
     ".qcb-tag[data-k=current]{border-color:#1677ff;color:#1677ff}",
+    ".qcb-tag[data-k=lost]{border-color:#cf1322;color:#cf1322}",
+    ".qcb-tag[data-k=empty]{border-color:#d46b08;color:#d46b08}",
+    ".qcb-row[data-disabled=true]{opacity:.55}",
+    ".qcb-hint{padding:6px 10px;font-size:11px;color:rgba(127,127,127,1);border-bottom:1px solid rgba(127,127,127,.14)}",
+    ".qcb-group{padding:6px 10px;font-size:11px;font-weight:600;color:rgba(127,127,127,1);background:rgba(127,127,127,.07);border-bottom:1px solid rgba(127,127,127,.14)}",
     ".qcb-foot{display:flex;flex-wrap:wrap;gap:6px;align-items:center;padding:8px 10px;border-top:1px solid rgba(127,127,127,.2)}",
     ".qcb-foot button{border:1px solid rgba(127,127,127,.35);background:transparent;color:inherit;border-radius:6px;height:26px;padding:0 10px;cursor:pointer}",
     ".qcb-foot button:disabled{opacity:.45;cursor:not-allowed}",
     ".qcb-foot button[data-danger=true]:not(:disabled){border-color:#d4380d;color:#d4380d}",
     ".qcb-foot .qcb-count{margin-right:auto;font-size:12px;color:rgba(127,127,127,1)}",
-    ".qcb-msg{padding:6px 10px;font-size:12px;border-top:1px solid rgba(127,127,127,.16)}",
-    ".qcb-msg[data-k=ok]{color:#389e0d}",
-    ".qcb-msg[data-k=warn]{color:#d46b08}",
-    ".qcb-msg[data-k=err]{color:#cf1322}",
     ".qcb-mask{position:fixed;inset:0;z-index:2147481999;background:transparent}",
     ".qcb-confirm{position:fixed;z-index:2147482100;width:420px;background:var(--qcb-bg,#fff);color:inherit;border:1px solid rgba(212,56,13,.5);border-radius:10px;box-shadow:0 12px 32px rgba(0,0,0,.24);padding:12px;font-size:13px}",
     ".qcb-confirm h4{margin:0 0 6px;font-size:13px}",
@@ -518,7 +690,7 @@
    * 七、面板
    * ================================================================== */
 
-  var ui = { panel: null, mask: null, list: null, foot: null, msg: null, count: null, confirm: null };
+  var ui = { panel: null, mask: null, list: null, foot: null, count: null, confirm: null };
   function el(tag, attrs, children) {
     var node = doc.createElement(tag);
     if (attrs) {
@@ -580,27 +752,33 @@
     var filters = el("div", { class: "qcb-filters" });
     var quick = el("div", { class: "qcb-quick" });
     var list = el("div", { class: "qcb-rows" });
-    var msg = el("div", { class: "qcb-msg", style: "display:none" });
     var count = el("span", { class: "qcb-count", text: "" });
     var foot = el("div", { class: "qcb-foot" }, [
       count,
       el("button", { text: t("归档", "Archive"), "data-act": "archive", onclick: function () { act("archive"); } }),
       el("button", { text: t("还原", "Unarchive"), "data-act": "unarchive", onclick: function () { act("unarchive"); } }),
       el("button", { text: t("删除", "Delete"), "data-act": "delete", "data-danger": "true", onclick: function () { act("delete"); } }),
+      el("button", {
+        text: t("恢复", "Restore"),
+        "data-act": "restore",
+        "data-primary": "true",
+        style: "display:none;margin-left:auto",
+        onclick: function () {
+          restoreSelected();
+        },
+      }),
     ]);
 
     panel.appendChild(head);
     panel.appendChild(filters);
     panel.appendChild(quick);
     panel.appendChild(list);
-    panel.appendChild(msg);
     panel.appendChild(foot);
 
     ui.panel = panel;
     ui.filters = filters;
     ui.quick = quick;
     ui.list = list;
-    ui.msg = msg;
     ui.count = count;
     ui.foot = foot;
     return panel;
@@ -614,6 +792,7 @@
       text: label,
       "aria-pressed": String(state.filters[key] === value),
       onclick: function () {
+        if (key === "view" && state.filters.view !== value) state.filters.group = "all";
         state.filters[key] = value;
         saveFilters();
         render();
@@ -639,6 +818,39 @@
     return sel;
   }
 
+  function stateOptions() {
+    return [
+      ["all", t("全部状态", "Any state")],
+      ["recoverable", t("可恢复", "Recoverable")],
+      ["lost", t("已丢失 / 空壳", "Lost / empty")],
+    ];
+  }
+
+  function groupOptions() {
+    var builtin = { default: t("未分组", "Uncategorized"), cron: t("定时任务", "Scheduled"), subagents: t("子代理", "Subagents") };
+    var opts = [["all", t("全部分组", "Any group")]];
+    var known = {};
+    (state.groups || []).forEach(function (g) {
+      if (!g || !g.id) return;
+      known[g.id] = true;
+      opts.push([g.id, builtin[g.kind] || g.name || g.id]);
+    });
+    // 分组接口还没回来时，退化用会话里出现过的 group_id（至少能筛）
+    var seen = {};
+    (state.chats || []).forEach(function (c) {
+      if (c.group_id) seen[c.group_id] = true;
+    });
+    Object.keys(seen).forEach(function (g) {
+      if (known[g]) return;
+      opts.push([g, builtin[g] || (g.length > 10 ? g.slice(0, 8) + "…" : g)]);
+    });
+    // 选中的分组要是没了（比如被删掉），回到「全部分组」，避免列表莫名空掉
+    if (state.filters.group !== "all" && !opts.some(function (o) { return o[0] === state.filters.group; })) {
+      state.filters.group = "all";
+    }
+    return opts;
+  }
+
   function renderFilters() {
     var wrap = ui.filters;
     wrap.textContent = "";
@@ -646,30 +858,28 @@
       segButton(t("活跃", "Active"), "active", "view", "view"),
       segButton(t("已归档", "Archived"), "archived", "view", "view"),
       segButton(t("全部", "All"), "all", "view", "view"),
+      segButton(t("已删除", "Deleted"), "deleted", "view", "view"),
     ]);
     wrap.appendChild(seg);
     wrap.appendChild(
-      selectField(t("来源", "Source"), [["all", t("全部来源", "Any source")], ["chat", "chat"], ["cron", "cron"], ["subagent", "subagent"]], "source"),
-    );
-    wrap.appendChild(
       selectField(
         t("时间", "Age"),
-        [[0, t("不限时间", "Any time")], [1, t("早于 1 天", "older than 1d")], [3, t("早于 3 天", "older than 3d")], [7, t("早于 7 天", "older than 7d")], [30, t("早于 30 天", "older than 30d")]],
+        state.filters.view === "deleted"
+          ? [[0, t("不限时间", "Any time")], [1, t("1 天以内", "within 1d")], [3, t("3 天以内", "within 3d")], [7, t("7 天以内", "within 7d")], [30, t("30 天以内", "within 30d")]]
+          : [[0, t("不限时间", "Any time")], [1, t("1 天前", "older than 1d")], [3, t("3 天前", "older than 3d")], [7, t("7 天前", "older than 7d")], [30, t("30 天前", "older than 30d")]],
         "ageDays",
       ),
     );
-    var q = el("input", {
-      type: "text",
-      placeholder: t("名称 / session_id 关键字", "name / session_id"),
-      value: state.filters.q || "",
-      oninput: function (e) {
-        state.filters.q = e.target.value;
-        saveFilters();
-        renderList();
-        renderFoot();
-      },
-    });
-    wrap.appendChild(q);
+    if (state.filters.view === "deleted") {
+      wrap.appendChild(
+        selectField(t("来源", "Source"), [["all", t("全部来源", "Any source")], ["chat", "chat"], ["cron", "cron"], ["subagent", "subagent"]], "source"),
+      );
+      wrap.appendChild(selectField(t("状态", "State"), stateOptions(), "group"));
+    } else {
+      // 来源（chat/cron/subagent）与内置分组一一对应，同时摆着是重复的，这里只留分组
+      if (state.filters.source !== "all") state.filters.source = "all";
+      wrap.appendChild(selectField(t("分组", "Group"), groupOptions(), "group"));
+    }
     var chk = function (label, key) {
       return el("label", { class: "qcb-chk", title: label }, [
         el("input", {
@@ -685,15 +895,61 @@
         el("span", { text: label }),
       ]);
     };
-    wrap.appendChild(chk(t("隐藏运行中", "Hide running"), "hideRunning"));
-    wrap.appendChild(chk(t("含 PawApp 会话", "Include PawApp"), "includeAppOwned"));
+    if (state.filters.view !== "deleted") {
+      wrap.appendChild(chk(t("隐藏运行中", "Hide running"), "hideRunning"));
+      wrap.appendChild(chk(t("含 PawApp 会话", "Include PawApp"), "includeAppOwned"));
+    }
+    // 搜索框放在筛选控件（分段视图 / 时间 / 分组 / 来源 / 状态）之后
+    wrap.appendChild(searchInput());
   }
 
   /* ---------- 快捷选择 ---------- */
 
+  function searchInput() {
+    return el("input", {
+      type: "text",
+      class: "qcb-search",
+      placeholder: t("名称 / session_id 关键字", "name / session_id"),
+      value: state.filters.q || "",
+      oninput: function (e) {
+        state.filters.q = e.target.value;
+        saveFilters();
+        renderList();
+        renderFoot();
+      },
+    });
+  }
+
   function renderQuick() {
     var wrap = ui.quick;
     wrap.textContent = "";
+    if (state.filters.view === "deleted") {
+      wrap.appendChild(
+        el("button", {
+          type: "button",
+          text: t("全选", "Select all"),
+          onclick: function () {
+            deletedFiltered().forEach(function (it) {
+              if (it.restorable) state.deletedSel[deletedKey(it)] = true;
+            });
+            renderList();
+            renderFoot();
+          },
+        }),
+      );
+      wrap.appendChild(
+        el("button", {
+          type: "button",
+          text: t("清空", "Clear"),
+          onclick: function () {
+            clearDeletedSel();
+            renderList();
+            renderFoot();
+          },
+        }),
+      );
+      return;
+    }
     var keepInput = el("input", {
       type: "number",
       min: "0",
@@ -729,7 +985,7 @@
     wrap.appendChild(
       el("button", {
         type: "button",
-        text: t("全选筛选结果", "Select filtered"),
+        text: t("全选", "Select all"),
         onclick: function () {
           var n = 0;
           visibleSorted().forEach(function (c) {
@@ -822,9 +1078,108 @@
     row.setAttribute("data-sel", String(!!state.selected[c.id]));
   }
 
+  function rowElDeleted(it) {
+    var key = deletedKey(it);
+    var can = !!it.restorable;
+    var sel = !!state.deletedSel[key];
+    var title = it.name || it.session_id;
+    var meta = it.session_id + (it.channel ? " · " + it.channel : "") + (it.user_id ? " · " + it.user_id : "");
+    var box = el("input", {
+      type: "checkbox",
+      checked: sel,
+      disabled: !can,
+      title: can ? t("恢复这个会话", "Restore this chat") : reasonText(it.reason),
+      onchange: function (e) {
+        if (e.target.checked) state.deletedSel[key] = true;
+        else delete state.deletedSel[key];
+        var row = box.parentNode;
+        if (row) row.setAttribute("data-sel", String(!!state.deletedSel[key]));
+        renderFoot();
+      },
+    });
+    var tags = [
+      el("span", { class: "qcb-tag", text: it.source || "chat" }),
+      el("span", { class: "qcb-tag", text: it.messages ? t(it.messages + " 条", it.messages + " msg") : t("0 条", "0 msg") }),
+      el("span", { class: "qcb-tag", text: fmtTime(it.mtime) }),
+    ];
+    if (it.state === "lost") tags.push(el("span", { class: "qcb-tag", "data-k": "lost", text: t("已丢失", "lost") }));
+    if (it.state === "empty") tags.push(el("span", { class: "qcb-tag", "data-k": "empty", text: t("空壳", "empty") }));
+    if (it.state === "unreadable") tags.push(el("span", { class: "qcb-tag", "data-k": "empty", text: t("不可读", "unreadable") }));
+    return el(
+      "div",
+      { class: "qcb-row", "data-id": it.session_id, "data-sel": String(sel), "data-disabled": String(!can) },
+      [box, el("span", { class: "qcb-name" }, [el("span", { text: title }), el("span", { class: "qcb-meta", text: "  " + meta })])].concat(tags),
+    );
+  }
+
+  function renderDeletedList() {
+    ensureDeleted();
+    // 「只看已选」只作用于活跃视图；已删除视图没有这个开关，避免切换视图后被空列表吓到
+    var all = deletedFiltered();
+    var lost = all.filter(function (it) {
+      return it.state !== "recoverable";
+    });
+    var rec = all.filter(function (it) {
+      return it.state === "recoverable";
+    });
+    var counts = state.deletedCounts || {};
+    var hint = t(
+      "可恢复 " + (counts.recoverable || 0) + " / 空壳 " + (counts.empty || 0) + " / 已丢失 " + (counts.lost || 0) + "，共 " + (state.deleted || []).length + " 条",
+      "recoverable " + (counts.recoverable || 0) + " / empty " + (counts.empty || 0) + " / lost " + (counts.lost || 0) + ", " + (state.deleted || []).length + " total",
+    );
+    ui.list.appendChild(el("div", { class: "qcb-hint", text: hint }));
+    if (state.deletedLoading && state.deleted === null) {
+      ui.list.appendChild(el("div", { class: "qcb-empty", text: t("扫描中…", "Scanning…") }));
+      return;
+    }
+    if (!all.length) {
+      ui.list.appendChild(
+        el("div", {
+          class: "qcb-empty",
+          text: t("没有符合筛选条件的已删除会话", "No deleted chats match the filter"),
+        }),
+      );
+      return;
+    }
+    var frag = doc.createDocumentFragment();
+    // 可恢复的在前（可操作），已丢失/空壳放后面（只作提示）
+    if (rec.length) {
+      frag.appendChild(
+        el("div", { class: "qcb-group", text: t("可恢复 " + rec.length + " 个（勾选后点右下角「恢复」）", "Restorable " + rec.length + " (tick, then Restore)") }),
+      );
+      rec.slice(0, state.rows).forEach(function (it) {
+        frag.appendChild(rowElDeleted(it));
+      });
+    }
+    if (lost.length) {
+      frag.appendChild(
+        el("div", { class: "qcb-group", text: t("已丢失 / 空壳 " + lost.length + " 个（不可恢复，仅作提示）", "Lost / empty " + lost.length + " (not restorable)") }),
+      );
+      lost.forEach(function (it) {
+        frag.appendChild(rowElDeleted(it));
+      });
+    }
+    ui.list.appendChild(frag);
+    if (rec.length > state.rows) {
+      ui.list.appendChild(
+        el("div", { class: "qcb-empty" }, [
+          el("button", {
+            class: "qcb-btn",
+            text: t("显示更多（已显示 " + state.rows + " / 共 " + rec.length + "）", "Show more (" + state.rows + " / " + rec.length + ")"),
+            onclick: function () {
+              state.rows += RENDER_STEP;
+              renderList();
+            },
+          }),
+        ]),
+      );
+    }
+  }
+
   function renderList() {
     if (!ui.list) return;
     ui.list.textContent = "";
+    if (state.filters.view === "deleted") return renderDeletedList();
     var all = visibleSorted();
     var rows = onlySelected
       ? all.filter(function (c) {
@@ -859,12 +1214,23 @@
   /* ---------- 底部动作 ---------- */
 
   function renderFoot() {
+    var deletedMode = state.filters.view === "deleted";
+    Array.prototype.forEach.call(ui.foot.querySelectorAll("button[data-act]"), function (b) {
+      var k = b.getAttribute("data-act");
+      b.style.display = (k === "restore") === deletedMode ? "" : "none";
+    });
+    if (deletedMode) {
+      var picked = selectedDeleted();
+      ui.count.textContent = t("已删除 " + (state.deleted || []).length + " 条", (state.deleted || []).length + " deleted");
+      var rb = ui.foot.querySelector('button[data-act="restore"]');
+      if (rb) {
+        rb.disabled = state.busy || picked.length === 0;
+        rb.textContent = t("恢复", "Restore") + (picked.length ? " " + picked.length : "");
+      }
+      return;
+    }
     var allSplit = CORE.splitByAction(state.chats, selectedIds(), false);
-    var n = selectedIds().length;
-    ui.count.textContent = t(
-      "已选 " + n + " 个（可归档 " + allSplit.archive.length + " / 可还原 " + allSplit.unarchive.length + " / 可删除 " + allSplit.delete.length + "）",
-      "Selected " + n + " (archive " + allSplit.archive.length + " / unarchive " + allSplit.unarchive.length + " / delete " + allSplit.delete.length + ")",
-    );
+    ui.count.textContent = t("已加载 " + state.chats.length + " 个会话", "Loaded " + state.chats.length + " chats");
     Array.prototype.forEach.call(ui.foot.querySelectorAll("button[data-act]"), function (b) {
       var k = b.getAttribute("data-act");
       var eligible = allSplit[k] ? allSplit[k].length : 0;
@@ -878,17 +1244,13 @@
     });
   }
 
+  /**
+   * 面板不再有独立提示行（按用户要求移除 .qcb-msg）；操作结果由列表变化和
+   * 按钮上的数字体现，失败原因写 console 便于排查。
+   */
   function setMessage(kind, text) {
     state.message = text ? { kind: kind || "warn", text: text } : null;
-    if (!ui.msg) return;
-    if (!state.message) {
-      ui.msg.style.display = "none";
-      ui.msg.textContent = "";
-      return;
-    }
-    ui.msg.style.display = "";
-    ui.msg.setAttribute("data-k", state.message.kind);
-    ui.msg.textContent = state.message.text;
+    if (kind === "err") console.warn("[" + PLUGIN_ID + "] " + text);
   }
 
   function render() {
@@ -1083,8 +1445,10 @@
     var silent = !!(opts && opts.silent);
     state.loading = true;
     if (!silent) setMessage(null);
-    return listChats()
-      .then(function (chats) {
+    var extra = state.filters.view === "deleted" ? loadDeleted(true) : Promise.resolve(null);
+    return Promise.all([listChats(), loadGroups(), extra])
+      .then(function (res) {
+        var chats = res[0];
         state.loading = false;
         render();
         if (!silent) setMessage("ok", t("已加载 " + chats.length + " 个会话", "Loaded " + chats.length + " chats"));
@@ -1223,6 +1587,22 @@
       var existing = row.querySelector("." + BTN_CLASS);
       var btn = existing || buildInlineButton();
       if (!existing) row.appendChild(btn);
+      // 尺寸对齐同一行里宿主自己的图标按钮（宿主版式变过：26 → 32，不能写死）
+      var ref = null;
+      Array.prototype.forEach.call(row.querySelectorAll("button"), function (b) {
+        if (!ref && !b.classList.contains(BTN_CLASS)) ref = b;
+      });
+      if (ref) {
+        var rect = ref.getBoundingClientRect();
+        var w = Math.round(rect.width);
+        var h = Math.round(rect.height);
+        if (w > 0 && h > 0 && w <= 48 && h <= 48) {
+          btn.style.width = w + "px";
+          btn.style.height = h + "px";
+          btn.style.minWidth = w + "px";
+          btn.style.lineHeight = h + "px";
+        }
+      }
       inlineBtns.push(btn);
     });
     syncButtons();
@@ -1327,6 +1707,21 @@
         archive: doArchive,
         unarchive: doUnarchive,
         remove: doDelete,
+        deleted: loadDeleted,
+        restore: restoreSelected,
+      },
+      deleted: function () {
+        return state.deleted || [];
+      },
+      setDeletedSelected: function (sessionId, on) {
+        (state.deleted || []).forEach(function (it) {
+          if (it.session_id === sessionId) {
+            if (on) state.deletedSel[deletedKey(it)] = true;
+            else delete state.deletedSel[deletedKey(it)];
+          }
+        });
+        renderList();
+        renderFoot();
       },
       setFilters: function (patch) {
         Object.assign(state.filters, patch || {});

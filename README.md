@@ -1,14 +1,17 @@
-# 🗂 会话批量管理（qwenpaw-chat-batch）v0.0.1
+# 🗂 会话批量管理（qwenpaw-chat-batch）v0.1.0
 
 侧栏「历史对话」标题右边一个小按钮，点开一个小面板：**按条件筛出会话 → 勾选 → 批量删除 / 批量归档 / 批量还原**。
 
 ![qwenpaw-chat-batch](https://raw.githubusercontent.com/chcsyf/qwenpaw-chat-batch/main/qwenpaw-chat-batch.png)
 
-纯前端插件（`type=frontend`），不写宿主任何文件、不起后端进程、不联网到站外；
+前端为主、带一个同进程小后端（`entry.frontend = index.js` + `entry.backend = plugin.py`）：
+前端只做面板与列表，后端只做两件事——扫描 `sessions/` 下的已删除会话、按宿主的
+`chat_manager` 补回注册条目。不新增端口、不手写 `chats.json`、不联网到站外；
 筛选条件存浏览器本地，卸载即无残留。
 
-- 插件 ID：`qwenpaw-chat-batch` ｜ 类型：`frontend` ｜ 版本：`0.0.1`
-- 入口：`index.js`（原生 DOM 按钮，挂在侧栏「历史对话」操作行 `sidebarSessionList-module__historyActions` 内）
+- 插件 ID：`qwenpaw-chat-batch` ｜ 版本：`0.1.0`
+- 入口：`index.js`（面板，原生 DOM 按钮挂在侧栏「历史对话」操作行 `sidebarSessionList-module__historyActions` 内）
+  ＋ `plugin.py`（`/api/qwenpaw-chat-batch/orphans`、`/restore`）
 - 兼容：QwenPaw 2.2.1 – 2.99.0（在 2.2.2 上开发验证）
 
 ---
@@ -51,15 +54,30 @@ qwenpaw plugin validate /path/to/qwenpaw-chat-batch
 ## 三、用法
 
 1. 点侧栏「历史对话」右边的 ☑ 图标展开面板（贴着按钮弹出；`Esc` 关闭、点面板外关闭；再次点击按钮收起）。
-2. 在筛选条选 **视图（活跃 / 已归档 / 全部）· 来源 · 时间（早于 N 天）· 关键字**，
-   可选「隐藏运行中」「含 PawApp 会话」。
-3. 用底部快捷区选择：`保留最近 N 个`（保留最近 N 个、选中其余）· `全选筛选结果` ·
+2. 在筛选条选 **视图（活跃 / 已归档 / 全部）· 时间（N 天前）· 分组 · 关键字**，
+   可选「隐藏运行中」「含 PawApp 会话」。（来源与内置分组一一对应，会话视图不再重复提供来源）
+3. 用底部快捷区选择：`保留最近 N 个`（保留最近 N 个、选中其余）· `全选` ·
    `反选` · `清空` · `只看已选`；也可以逐行勾。**运行中的会话勾选框是禁用的**。
 4. 底部按钮显示各自可执行的条数：`归档 N` / `还原 N` / `删除 N`，点一下执行。
-   - 归档、还原可逆，直接执行，结果回报成功/失败与原因（`in_progress` / `not_found`）。
+   - 归档、还原可逆，直接执行，结果以列表与按钮数字体现（失败原因写 console）。
    - 删除弹确认框：列出会话名、提示不可撤销、若含当前打开的会话会单独标出；
      必须勾「我已确认」才能点确认。要连运行中的一起删，需另开一个开关。
 5. 操作后自动重新拉取列表并刷新计数；面板里也标出「当前打开的会话」，方便你避开它。
+
+### 3.1 已删除视图：找回删掉的会话
+
+宿主删除会话只摘 `chats.json` 里的注册条目，`sessions/<channel>/<user>_<sid>.json` 里的
+对话本体仍在。切到 **已删除** 视图即可看到：
+
+- **可恢复**：状态文件在、注册条目没了，且文件里有对话（勾选后点右下角 `恢复 N`）；
+- **已丢失 / 空壳**：注册好却找不到状态文件（`.synced.json` 里可能还记着当时的消息数），
+  或文件里没有对话内容——这些置灰、不可勾选，只作提示。
+
+筛选用 `时间（N 天以内）` / `来源` / `状态`，快捷区保留 `全选` / `清空`；一次恢复超过
+10 条会二次确认。恢复走宿主的 `chat_manager.get_or_create_chat()`，复用其锁与原子写。
+
+> 注意：删除时宿主会一并删掉该会话的 checkpoint（文件快照/undo 历史），恢复只恢复
+> 对话与注册条目，checkpoint 不会回来；恢复后时间戳记为「现在」。
 
 ## 四、入口位置与宿主 DOM 的关系
 
@@ -84,6 +102,9 @@ qwenpaw plugin validate /path/to/qwenpaw-chat-batch
 | `POST /api/chats/actions/batch-archive` | 批量归档 | body `{"chat_ids":[…]}`，单次 ≤500，**服务端会跳过 running** 并放进 `failed[{reason:"in_progress"}]` |
 | `POST /api/chats/actions/batch-unarchive` | 批量还原 | 同上，body `{"chat_ids":[…]}` |
 | `POST /api/chats/batch-delete` | 批量删除 | body 是**裸数组** `["id",…]`（不是 `{chat_ids}`），单次 ≤500；返回 `{"deleted":bool}`，**不回条数**，所以本插件用操作前后列表 diff 报真实删除数；会连带删掉该会话的 checkpoint |
+| `GET /api/chats/groups` | 分组真名 | 面板「分组」下拉用它的 `name`，内置组按 `kind` 本地化 |
+| `GET /api/qwenpaw-chat-batch/orphans` | 扫描已删除 | 本插件后端；读 `chats.json`、`sessions/**/*.json`、`.synced.json`，分四档返回 |
+| `POST /api/qwenpaw-chat-batch/restore` | 恢复会话 | 本插件后端；逐条校验后 `get_or_create_chat()` 补注册 |
 
 单次 500 的上限与宿主 `app/chats/manager.py` 的 `MAX_BATCH_SIZE` 对齐；插件内部
 `CORE.MAX_BATCH = 500` 并自动分块，`test_core.js` 有一条测试钉住这个值。
